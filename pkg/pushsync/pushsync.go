@@ -93,13 +93,15 @@ func (ps *PushSync) handler(ctx context.Context, p p2p.Peer, stream p2p.Stream) 
 	w, r := protobuf.NewWriterAndReader(stream)
 	defer func() {
 		if err != nil {
+			fmt.Println("11")
 			ps.metrics.TotalErrors.Inc()
 			_ = stream.Reset()
 		} else {
+			fmt.Println("12")
 			_ = stream.FullClose()
 		}
 	}()
-
+	fmt.Println("1")
 	var ch pb.Delivery
 	if err = r.ReadMsgWithContext(ctx, &ch); err != nil {
 		return fmt.Errorf("pushsync read delivery: %w", err)
@@ -115,12 +117,14 @@ func (ps *PushSync) handler(ctx context.Context, p p2p.Peer, stream p2p.Stream) 
 	} else if !soc.Valid(chunk) {
 		return swarm.ErrInvalidChunk
 	}
+	fmt.Println("2")
 
 	span, _, ctx := ps.tracer.StartSpanFromContext(ctx, "pushsync-handler", ps.logger, opentracing.Tag{Key: "address", Value: chunk.Address().String()})
 	defer span.Finish()
 
 	receipt, err := ps.pushToClosest(ctx, chunk)
 	if err != nil {
+		fmt.Println("3")
 		if errors.Is(err, topology.ErrWantSelf) {
 			// this is to make sure that the sent number does not diverge from the synced counter
 			// the edge case is on the uploader node, in the case where the uploader node is
@@ -138,16 +142,19 @@ func (ps *PushSync) handler(ctx context.Context, p p2p.Peer, stream p2p.Stream) 
 			if err != nil {
 				return fmt.Errorf("chunk store: %w", err)
 			}
+			fmt.Println("4")
 
 			receipt := &pb.Receipt{Address: chunk.Address().Bytes()}
-			if err := w.WriteMsgWithContext(ctx, receipt); err != nil {
+			if err := w.WriteMsg(receipt); err != nil {
 				return fmt.Errorf("send receipt to peer %s: %w", p.Address.String(), err)
 			}
+			fmt.Println("5")
 
 			return ps.accounting.Debit(p.Address, ps.pricer.Price(chunk.Address()))
 		}
 		return fmt.Errorf("handler: push to closest: %w", err)
 	}
+	fmt.Println("6")
 
 	// pass back the received receipt in the previously received stream
 	ctx, cancel := context.WithTimeout(ctx, timeToWaitForReceipt)
@@ -155,6 +162,7 @@ func (ps *PushSync) handler(ctx context.Context, p p2p.Peer, stream p2p.Stream) 
 	if err := w.WriteMsgWithContext(ctx, receipt); err != nil {
 		return fmt.Errorf("send receipt to peer %s: %w", p.Address.String(), err)
 	}
+	fmt.Println("7")
 
 	return ps.accounting.Debit(p.Address, ps.pricer.Price(chunk.Address()))
 }
@@ -261,14 +269,10 @@ func (ps *PushSync) pushToClosest(ctx context.Context, ch swarm.Chunk) (*pb.Rece
 			}
 		}
 
-		var receipt *pb.Receipt
+		var receipt pb.Receipt
 		ctx, cancel = context.WithTimeout(ctx, timeToWaitForReceipt)
 		defer cancel()
-		if err := r.ReadMsgWithContext(ctx, receipt); err != nil {
-			return nil, err
-		}
-
-		if err != nil {
+		if err := r.ReadMsg(&receipt); err != nil {
 			ps.metrics.TotalErrors.Inc()
 			_ = streamer.Reset()
 			lastErr = fmt.Errorf("chunk %s receive receipt from peer %s: %w", ch.Address().String(), peer.String(), err)
@@ -287,7 +291,7 @@ func (ps *PushSync) pushToClosest(ctx context.Context, ch swarm.Chunk) (*pb.Rece
 			return nil, err
 		}
 
-		return receipt, nil
+		return &receipt, nil
 	}
 
 	logger.Tracef("pushsync: failed to push chunk %s: reached max peers of %v", ch.Address(), maxPeers)

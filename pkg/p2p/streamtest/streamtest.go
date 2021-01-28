@@ -7,6 +7,7 @@ package streamtest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -213,27 +214,37 @@ func (s *stream) Close() error {
 }
 
 func (s *stream) FullClose() error {
+	fmt.Println("test close")
 	if err := s.Close(); err != nil {
 		_ = s.Reset()
 		return err
 	}
+	fmt.Println("test close11")
 
 	waitStart := time.Now()
 
 	for {
+
+		fmt.Println("test close for")
 		if s.out.Closed() {
+			fmt.Println("test close for closed")
 			return nil
 		}
 
 		if time.Since(waitStart) >= fullCloseTimeout {
+			fmt.Println("test close for err fullclose")
 			return ErrStreamFullcloseTimeout
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
+
+	fmt.Println("test close for nix")
+	return nil
 }
 
 func (s *stream) Reset() (err error) {
+	fmt.Println("reset")
 	if err := s.in.Close(); err != nil {
 		_ = s.out.Close()
 		return err
