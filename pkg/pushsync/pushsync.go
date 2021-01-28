@@ -112,75 +112,23 @@ func (ps *PushSync) handler(ctx context.Context, p p2p.Peer, stream p2p.Stream) 
 		if ps.unwrap != nil {
 			go ps.unwrap(chunk)
 		}
-	} else {
-		if !soc.Valid(chunk) {
-			return swarm.ErrInvalidChunk
-		}
+	} else if !soc.Valid(chunk) {
+		return swarm.ErrInvalidChunk
 	}
 
 	span, _, ctx := ps.tracer.StartSpanFromContext(ctx, "pushsync-handler", ps.logger, opentracing.Tag{Key: "address", Value: chunk.Address().String()})
 	defer span.Finish()
 
-	// Select the closest peer to forward the chunk
-	peer, err := ps.peerSuggester.ClosestPeer(chunk.Address())
+	receipt, err := ps.PushChunkToClosest(ctx, chunk)
 	if err != nil {
-		// If i am the closest peer then store the chunk and send receipt
-		if errors.Is(err, topology.ErrWantSelf) {
-			return ps.handleDeliveryResponse(ctx, w, p, chunk)
-		}
-		return err
+		return fmt.Errorf("handler: push to closest: %w", err)
 	}
 
-	// This is a special situation in that the other peer thinks thats we are the closest node
-	// and we think that the sending peer is the closest
-	if p.Address.Equal(peer) {
-		return ps.handleDeliveryResponse(ctx, w, p, chunk)
-	}
-
-	// compute the price we pay for this receipt and reserve it for the rest of this function
-	receiptPrice := ps.pricer.PeerPrice(peer, chunk.Address())
-	err = ps.accounting.Reserve(ctx, peer, receiptPrice)
-	if err != nil {
-		return fmt.Errorf("reserve balance for peer %s: %w", peer.String(), err)
-	}
-	defer ps.accounting.Release(peer, receiptPrice)
-
-	// Forward chunk to closest peer
-	streamer, err := ps.streamer.NewStream(ctx, peer, nil, protocolName, protocolVersion, streamName)
-	if err != nil {
-		return fmt.Errorf("new stream peer %s: %w", peer.String(), err)
-	}
-	defer func() {
-		if err != nil {
-			_ = streamer.Reset()
-		} else {
-			go streamer.FullClose()
-		}
-	}()
-
-	wc, rc := protobuf.NewWriterAndReader(streamer)
-	if err := ps.sendChunkDelivery(ctx, wc, chunk); err != nil {
-		return fmt.Errorf("forward chunk to peer %s: %w", peer.String(), err)
-	}
-
-	receipt, err := ps.receiveReceipt(ctx, rc)
-	if err != nil {
-		return fmt.Errorf("receive receipt from peer %s: %w", peer.String(), err)
-	}
-
-	// Check if the receipt is valid
-	if !chunk.Address().Equal(swarm.NewAddress(receipt.Address)) {
-		return fmt.Errorf("invalid receipt from peer %s", peer.String())
-	}
-
-	err = ps.accounting.Credit(peer, receiptPrice)
-	if err != nil {
-		return err
-	}
-
+	receiptPb := &pb.Receipt{Address: receipt.Address.Bytes()}
 	// pass back the received receipt in the previously received stream
-	err = ps.sendReceipt(ctx, w, &receipt)
-	if err != nil {
+	ctx, cancel := context.WithTimeout(ctx, timeToWaitForReceipt)
+	defer cancel()
+	if err := w.WriteMsgWithContext(ctx, &receiptPb); err != nil {
 		return fmt.Errorf("send receipt to peer %s: %w", peer.String(), err)
 	}
 
@@ -194,15 +142,6 @@ func (ps *PushSync) sendChunkDelivery(ctx context.Context, w protobuf.Writer, ch
 		Address: chunk.Address().Bytes(),
 		Data:    chunk.Data(),
 	})
-}
-
-func (ps *PushSync) sendReceipt(ctx context.Context, w protobuf.Writer, receipt *pb.Receipt) (err error) {
-	ctx, cancel := context.WithTimeout(ctx, timeToWaitForReceipt)
-	defer cancel()
-	if err := w.WriteMsgWithContext(ctx, receipt); err != nil {
-		return err
-	}
-	return nil
 }
 
 func (ps *PushSync) receiveReceipt(ctx context.Context, r protobuf.Reader) (receipt pb.Receipt, err error) {
@@ -334,11 +273,7 @@ func (ps *PushSync) PushChunkToClosest(ctx context.Context, ch swarm.Chunk) (r *
 			return nil, err
 		}
 
-		rec := &Receipt{
-			Address: swarm.NewAddress(receipt.Address),
-		}
-
-		return rec, nil
+		return receipt, nil
 	}
 
 	logger.Tracef("pushsync-push: failed to push chunk %s: reached max peers of %v", ch.Address(), maxPeers)
