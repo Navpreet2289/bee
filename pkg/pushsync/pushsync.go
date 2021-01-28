@@ -121,6 +121,31 @@ func (ps *PushSync) handler(ctx context.Context, p p2p.Peer, stream p2p.Stream) 
 
 	receipt, err := ps.pushToClosest(ctx, chunk)
 	if err != nil {
+		if errors.Is(err, topology.ErrWantSelf) {
+			// this is to make sure that the sent number does not diverge from the synced counter
+			// the edge case is on the uploader node, in the case where the uploader node is
+			// connected to other nodes, but is the closest one to the chunk.
+			t, err := ps.tagger.Get(chunk.TagID())
+			if err == nil && t != nil {
+				err = t.Inc(tags.StateSent)
+				if err != nil {
+					return err
+				}
+			}
+
+			// store the chunk in the local store
+			_, err = ps.storer.Put(ctx, storage.ModePutSync, chunk)
+			if err != nil {
+				return fmt.Errorf("chunk store: %w", err)
+			}
+
+			receipt := &pb.Receipt{Address: chunk.Address().Bytes()}
+			if err := w.WriteMsgWithContext(ctx, receipt); err != nil {
+				return fmt.Errorf("send receipt to peer %s: %w", p.Address.String(), err)
+			}
+
+			return ps.accounting.Debit(p.Address, ps.pricer.Price(chunk.Address()))
+		}
 		return fmt.Errorf("handler: push to closest: %w", err)
 	}
 
@@ -183,23 +208,9 @@ func (ps *PushSync) pushToClosest(ctx context.Context, ch swarm.Chunk) (*pb.Rece
 				return nil, err
 			}
 
-			// When ErrWantSelf is returned, it means we are the closest peer.
+			// when ErrWantSelf is returned, it means we are the closest peer.
 			if errors.Is(err, topology.ErrWantSelf) {
-				// this is to make sure that the sent number does not diverge from the synced counter
-				// the edge case is on the uploader node, in the case where the uploader node is
-				// connected to other nodes, but is the closest one to the chunk.
-				t, err := ps.tagger.Get(ch.TagID())
-				if err == nil && t != nil {
-					err = t.Inc(tags.StateSent)
-					if err != nil {
-						return nil, err
-					}
-				}
-
-				// if you are the closest node return a receipt immediately
-				return &Receipt{
-					Address: ch.Address(),
-				}, nil
+				return nil, err
 			}
 
 			return nil, fmt.Errorf("closest peer: %w", err)
@@ -250,10 +261,10 @@ func (ps *PushSync) pushToClosest(ctx context.Context, ch swarm.Chunk) (*pb.Rece
 			}
 		}
 
-		var receipt pb.Receipt
+		var receipt *pb.Receipt
 		ctx, cancel = context.WithTimeout(ctx, timeToWaitForReceipt)
 		defer cancel()
-		if err := r.ReadMsgWithContext(ctx, &receipt); err != nil {
+		if err := r.ReadMsgWithContext(ctx, receipt); err != nil {
 			return nil, err
 		}
 
@@ -261,7 +272,7 @@ func (ps *PushSync) pushToClosest(ctx context.Context, ch swarm.Chunk) (*pb.Rece
 			ps.metrics.TotalErrors.Inc()
 			_ = streamer.Reset()
 			lastErr = fmt.Errorf("chunk %s receive receipt from peer %s: %w", ch.Address().String(), peer.String(), err)
-			logger.Debugf("pushsync-push: %v", lastErr)
+			logger.Debugf("pushsync error: %v", lastErr)
 			continue
 		}
 
@@ -276,31 +287,14 @@ func (ps *PushSync) pushToClosest(ctx context.Context, ch swarm.Chunk) (*pb.Rece
 			return nil, err
 		}
 
-		return &Receipt{Address: receipt.Address}, nil
+		return receipt, nil
 	}
 
-	logger.Tracef("pushsync-push: failed to push chunk %s: reached max peers of %v", ch.Address(), maxPeers)
+	logger.Tracef("pushsync: failed to push chunk %s: reached max peers of %v", ch.Address(), maxPeers)
 
 	if lastErr != nil {
 		return nil, lastErr
 	}
 
 	return nil, topology.ErrNotFound
-}
-
-func (ps *PushSync) handleDeliveryResponse(ctx context.Context, w protobuf.Writer, p p2p.Peer, chunk swarm.Chunk) error {
-	// Store the chunk in the local store
-	_, err := ps.storer.Put(ctx, storage.ModePutSync, chunk)
-	if err != nil {
-		return fmt.Errorf("chunk store: %w", err)
-	}
-
-	// Send a receipt immediately once the storage of the chunk is successfully
-	receipt := &pb.Receipt{Address: chunk.Address().Bytes()}
-	err = ps.sendReceipt(ctx, w, receipt)
-	if err != nil {
-		return fmt.Errorf("send receipt to peer %s: %w", p.Address.String(), err)
-	}
-
-	return ps.accounting.Debit(p.Address, ps.pricer.Price(chunk.Address()))
 }
